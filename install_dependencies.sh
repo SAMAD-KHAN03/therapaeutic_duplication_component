@@ -72,17 +72,30 @@ sudo apt-get install -y --no-install-recommends \
     lsof
 success "Base system packages installed"
 
-# Python 3.12
-if ! command -v $PYTHON_CMD &>/dev/null; then
-    info "Installing Python 3.12 from deadsnakes PPA..."
-    sudo add-apt-repository -y ppa:deadsnakes/ppa
-    sudo apt-get update -qq
-    sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
-    curl -sS https://bootstrap.pypa.io/get-pip.py | sudo $PYTHON_CMD - --quiet
-else
-    info "$($PYTHON_CMD --version) already installed"
+# Python 3.12 — always add PPA and ensure ALL required packages are present,
+# even if the python3.12 binary already exists (venv/dev may still be missing).
+info "Adding deadsnakes PPA for Python 3.12..."
+sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
+sudo apt-get update -qq
+
+info "Installing / verifying python3.12, python3.12-venv, python3.12-dev..."
+sudo apt-get install -y \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    python3-pip
+
+# Verify the venv module is actually importable before proceeding
+if ! $PYTHON_CMD -c "import ensurepip" 2>/dev/null; then
+    # ensurepip ships with python3.12-venv on Debian/Ubuntu — if still missing, force reinstall
+    warn "ensurepip not found after install — forcing reinstall of python3.12-venv..."
+    sudo apt-get install -y --reinstall python3.12-venv
 fi
-success "Python 3.12 ready"
+
+$PYTHON_CMD -c "import ensurepip" \
+    || fail "python3.12-venv is still broken. Run: sudo apt-get install --reinstall python3.12-venv"
+
+success "Python $($PYTHON_CMD --version) ready (venv module confirmed)"
 
 # PostgreSQL
 if ! command -v psql &>/dev/null; then
@@ -142,10 +155,21 @@ PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB
 # ── 3. Python virtual environment ─────────────────────────────────────────────
 section "Step 3: Setting up Python virtual environment"
 
+# If a venv directory exists but the python binary inside is broken/missing,
+# remove it so we get a clean rebuild.
 if [ -d "$VENV_PATH" ]; then
-    warn "Virtual environment already exists at $VENV_PATH — reusing it"
-else
-    $PYTHON_CMD -m venv "$VENV_PATH"
+    if "${VENV_PATH}/bin/python3" -c "import sys" 2>/dev/null; then
+        warn "Virtual environment already exists and is healthy — reusing it"
+    else
+        warn "Existing venv at $VENV_PATH appears broken — removing and rebuilding..."
+        rm -rf "$VENV_PATH"
+    fi
+fi
+
+if [ ! -d "$VENV_PATH" ]; then
+    info "Creating virtual environment at $VENV_PATH ..."
+    $PYTHON_CMD -m venv "$VENV_PATH" \
+        || fail "venv creation failed. Ensure python3.12-venv is installed: sudo apt-get install python3.12-venv"
     success "Virtual environment created at $VENV_PATH"
 fi
 
@@ -170,7 +194,7 @@ success "Python packages installed"
 # ── 5. Validate imports ───────────────────────────────────────────────────────
 section "Step 5: Validating Python imports"
 
-$PYTHON_CMD - <<'PYCHECK'
+"${VENV_PATH}/bin/python3" - <<'PYCHECK'
 import flask, psycopg2, dotenv, gunicorn
 print("  flask        :", flask.__version__)
 print("  psycopg2     :", psycopg2.__version__)

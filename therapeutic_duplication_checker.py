@@ -3,14 +3,18 @@ therapeutic_duplication_checker.py
 ------------------------------------
 Core engine for detecting and evaluating therapeutic duplication.
 
-All caching is handled by PostgreSQL via pg_store.py — no cache_dir arguments.
+All caching is handled by PostgreSQL via pg_store.py -- no cache_dir arguments.
 
-Key behaviours:
+Key behaviours
+--------------
   1. CONVENTIONAL_DMARD same-class pair -> different MOA allowed (not a duplicate)
   2. ANTIMYCOBACTERIAL same-class pair  -> TB combination therapy is mandatory
-  3. Ezetimibe + Statin: different class, different MOA -> shared indication match only
-  4. Duplicate detection only fires on SAME class AND/OR SAME MOA
-  5. Report includes NICE guideline, section reference, and URL for every finding
+  3. Ezetimibe + Statin: different class, different MOA -> shared indication only
+  4. Duplicate detection fires on SAME class AND/OR SAME MOA
+  5. After duplicate detection, NICE guideline text is retrieved and sent as
+     RAG context to Gemini (via nice_api_client + gemini_evaluator) which
+     returns a structured verdict -- no regex/substring classification used.
+  6. Report includes NICE guideline, section reference, and URL for every finding.
 """
 
 from __future__ import annotations
@@ -66,7 +70,7 @@ _ALWAYS_UNIQUE_CLASS_PAIRS = frozenset([
 ])
 
 _KNOWN_COMBINATION_PAIRS = frozenset([
-    # Hypertension multi-drug therapy
+    # Hypertension
     frozenset({"ACE_INHIBITOR", "BETA_BLOCKER"}),
     frozenset({"ACE_INHIBITOR", "CALCIUM_CHANNEL_BLOCKER"}),
     frozenset({"ACE_INHIBITOR", "THIAZIDE_DIURETIC"}),
@@ -85,7 +89,7 @@ _KNOWN_COMBINATION_PAIRS = frozenset([
     frozenset({"MINERALOCORTICOID_RECEPTOR_ANTAGONIST", "SGLT2_INHIBITOR"}),
     # Lipid lowering
     frozenset({"STATIN", "EZETIMIBE"}),
-    # T2DM combinations
+    # T2DM
     frozenset({"BIGUANIDE", "SGLT2_INHIBITOR"}),
     frozenset({"BIGUANIDE", "SULFONYLUREA"}),
     frozenset({"BIGUANIDE", "GLP1_AGONIST"}),
@@ -144,9 +148,9 @@ class PrescriptionAnalysisReport:
         )]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Duplicate detection
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Duplicate detection  (unchanged logic)
+# ---------------------------------------------------------------------------
 
 def _check_duplicate(profile_a, profile_b) -> Tuple[
     bool, List[DuplicateReason], List[str], List[str], Set[str],
@@ -187,85 +191,75 @@ def _check_duplicate(profile_a, profile_b) -> Tuple[
     return bool(reasons), reasons, shared_classes, shared_moas, shared_ind
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Outcome classification
-# ──────────────────────────────────────────────────────────────────────────────
+#
+# The recommendation field on each CombinationRule is now always set by
+# Gemini (via nice_api_client.find_combination_rules).  This function simply
+# maps the Gemini verdict string to a PairOutcome enum value and formats the
+# detail text -- it no longer contains any regex or substring logic.
+# ---------------------------------------------------------------------------
 
-def _classify_outcome(rules, shared_indications: Set[str]) -> Tuple[PairOutcome, str]:
+_GEMINI_REC_TO_OUTCOME = {
+    "CONTRAINDICATED":  PairOutcome.DUPLICATE_CONTRAINDICATED,
+    "NOT_RECOMMENDED":  PairOutcome.DUPLICATE_NOT_RECOMMENDED,
+    "CONDITIONAL":      PairOutcome.DUPLICATE_CONDITIONAL,
+    "SUPPORTED":        PairOutcome.DUPLICATE_SUPPORTED,
+}
+
+
+def _classify_outcome(
+    rules: List[Tuple[str, Any]],
+    shared_indications: Set[str],
+) -> Tuple[PairOutcome, str]:
+    """
+    Map a list of (code, CombinationRule) -- whose recommendation field is
+    set by Gemini -- to a PairOutcome + formatted detail string.
+
+    Priority order: CONTRAINDICATED > NOT_RECOMMENDED > CONDITIONAL > SUPPORTED
+    (most severe wins, same as before).
+    """
     if not rules:
         return (
             PairOutcome.DUPLICATE_NO_RATIONALE,
             (
                 "No specific NICE guideline recommendation was found to support or "
                 "prohibit this combination. This does not mean the combination is "
-                "acceptable — clinical judgement and BNF/SPC review are required."
+                "acceptable -- clinical judgement and BNF/SPC review are required."
             ),
         )
 
-    rec_types = {rule.recommendation for _, rule in rules}
     priority_order = ["CONTRAINDICATED", "NOT_RECOMMENDED", "CONDITIONAL", "SUPPORTED"]
+    rec_types = {rule.recommendation for _, rule in rules}
 
     for priority in priority_order:
         if priority not in rec_types:
             continue
-        applicable = [(code, r) for code, r in rules if r.recommendation == priority]
-        code, rule = applicable[0]
-        cond_text = "; ".join(rule.conditions) if rule.conditions else ""
 
-        if priority == "CONTRAINDICATED":
-            return (
-                PairOutcome.DUPLICATE_CONTRAINDICATED,
-                (
-                    f"CONTRAINDICATED per NICE {code} ({rule.section_ref}).\n"
-                    f"   Recommendation: {rule.recommendation_text}\n"
-                    f"   Rationale: {rule.rationale}"
-                    + (f"\n   Conditions: {cond_text}" if cond_text else "")
-                    + f"\n   Guideline: {rule.url}"
-                ),
-            )
-        elif priority == "NOT_RECOMMENDED":
-            return (
-                PairOutcome.DUPLICATE_NOT_RECOMMENDED,
-                (
-                    f"NOT RECOMMENDED per NICE {code} ({rule.section_ref}).\n"
-                    f"   Recommendation: {rule.recommendation_text}\n"
-                    f"   Rationale: {rule.rationale}"
-                    + (f"\n   Conditions: {cond_text}" if cond_text else "")
-                    + f"\n   Guideline: {rule.url}"
-                ),
-            )
-        elif priority == "CONDITIONAL":
-            return (
-                PairOutcome.DUPLICATE_CONDITIONAL,
-                (
-                    f"CONDITIONALLY SUPPORTED per NICE {code} ({rule.section_ref}).\n"
-                    f"   Recommendation: {rule.recommendation_text}"
-                    + (f"\n   Conditions: {cond_text}" if cond_text else "")
-                    + f"\n   Rationale: {rule.rationale}"
-                    + f"\n   Guideline: {rule.url}"
-                ),
-            )
-        elif priority == "SUPPORTED":
-            return (
-                PairOutcome.DUPLICATE_SUPPORTED,
-                (
-                    f"SUPPORTED per NICE {code} ({rule.section_ref}).\n"
-                    f"   Recommendation: {rule.recommendation_text}\n"
-                    f"   Rationale: {rule.rationale}"
-                    + (f"\n   Conditions: {cond_text}" if cond_text else "")
-                    + f"\n   Guideline: {rule.url}"
-                ),
-            )
+        outcome = _GEMINI_REC_TO_OUTCOME.get(priority, PairOutcome.DUPLICATE_CONDITIONAL)
+        code, rule = next((c, r) for c, r in rules if r.recommendation == priority)
+        cond_text  = "; ".join(rule.conditions) if rule.conditions else ""
+
+        detail_lines = [
+            "%s per NICE %s (%s)." % (priority.replace("_", " "), code, rule.section_ref),
+            "   Recommendation : %s" % rule.recommendation_text,
+            "   Strength       : %s" % rule.strength,
+        ]
+        if cond_text:
+            detail_lines.append("   Conditions     : %s" % cond_text)
+        detail_lines.append("   Guideline      : %s" % rule.url)
+
+        return outcome, "\n".join(detail_lines)
 
     return (
         PairOutcome.DUPLICATE_NO_RATIONALE,
-        "Rules found but none matched a known recommendation type.",
+        "Rules retrieved but none contained a recognised recommendation type.",
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main checker — no cache_dir; all persistence via PostgreSQL
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main checker
+# ---------------------------------------------------------------------------
 
 class TherapeuticDuplicationChecker:
 
@@ -299,7 +293,9 @@ class TherapeuticDuplicationChecker:
         ]
 
         for (name_a, pa), (name_b, pb) in itertools.combinations(resolvable, 2):
-            result = DrugPairResult(drug_a=name_a, drug_b=name_b, profile_a=pa, profile_b=pb)
+            result = DrugPairResult(
+                drug_a=name_a, drug_b=name_b, profile_a=pa, profile_b=pb
+            )
 
             (
                 result.is_duplicate,
@@ -312,16 +308,21 @@ class TherapeuticDuplicationChecker:
             if not result.is_duplicate:
                 result.outcome = PairOutcome.UNIQUE
                 result.outcome_detail = (
-                    f"No therapeutic overlap: {name_a} ({pa.drug_class}) and "
-                    f"{name_b} ({pb.drug_class}) have different classes and mechanisms."
+                    "No therapeutic overlap: %s (%s) and %s (%s) "
+                    "have different classes and mechanisms."
+                    % (name_a, pa.drug_class, name_b, pb.drug_class)
                 )
             else:
+                # Retrieve NICE rules and send RAG to Gemini.
+                # profile_a / profile_b are passed so Gemini receives MOA context.
                 result.nice_rules_found = self._nice.find_combination_rules(
                     drug_a_class=pa.drug_class,
                     drug_b_class=pb.drug_class,
                     drug_a_name=pa.name,
                     drug_b_name=pb.name,
                     shared_indications=result.shared_indications,
+                    profile_a=pa,
+                    profile_b=pb,
                 )
                 result.outcome, result.outcome_detail = _classify_outcome(
                     result.nice_rules_found, result.shared_indications
@@ -337,25 +338,24 @@ class TherapeuticDuplicationChecker:
             "                 THERAPEUTIC DUPLICATION CHECK REPORT",
             "=" * 90,
             "",
-            f"Prescription ({len(report.medications)} medications):",
+            "Prescription (%d medications):" % len(report.medications),
         ]
 
         for i, med in enumerate(report.medications, 1):
             profile = report.resolved_profiles.get(med)
             if profile:
-                src = f"[{profile.source.upper()}]" if hasattr(profile, "source") else ""
+                src = "[%s]" % profile.source.upper() if hasattr(profile, "source") else ""
                 lines.append(
-                    f"  {i:2}. {med.upper():<30} "
-                    f"Class: {profile.drug_class:<40} "
-                    f"MOA: {profile.mechanism_of_action} {src}"
+                    "  %2d. %-30s Class: %-40s MOA: %s %s"
+                    % (i, med.upper(), profile.drug_class, profile.mechanism_of_action, src)
                 )
             else:
-                lines.append(f"  {i:2}. {med.upper():<30} [UNRESOLVED]")
+                lines.append("  %2d. %-30s [UNRESOLVED]" % (i, med.upper()))
 
         if report.unresolved_drugs:
             lines += ["", "WARNING: UNRESOLVED DRUGS (manual review required):"]
             for d in report.unresolved_drugs:
-                lines.append(f"   - {d}")
+                lines.append("   - %s" % d)
 
         lines += ["", "-" * 90, "  PAIR-BY-PAIR ANALYSIS", "-" * 90]
 
@@ -372,35 +372,37 @@ class TherapeuticDuplicationChecker:
             icon = icon_map.get(result.outcome, "?")
             lines += [
                 "",
-                f"  {icon}",
-                f"  Drug Pair : {result.drug_a.upper()}  <->  {result.drug_b.upper()}",
-                f"  Outcome   : {result.outcome.value}",
+                "  %s" % icon,
+                "  Drug Pair : %s  <->  %s" % (result.drug_a.upper(), result.drug_b.upper()),
+                "  Outcome   : %s" % result.outcome.value,
             ]
             if result.is_duplicate:
                 lines.append(
-                    f"  Overlap   : {', '.join(r.value for r in result.duplicate_reasons)}"
+                    "  Overlap   : %s" % ", ".join(r.value for r in result.duplicate_reasons)
                 )
                 if result.shared_classes:
-                    lines.append(f"  Shared Class : {', '.join(result.shared_classes)}")
+                    lines.append("  Shared Class : %s" % ", ".join(result.shared_classes))
                 if result.shared_moas:
-                    lines.append(f"  Shared MOA   : {', '.join(result.shared_moas)}")
+                    lines.append("  Shared MOA   : %s" % ", ".join(result.shared_moas))
                 if result.shared_indications:
                     lines.append(
-                        f"  Shared Indication(s): {', '.join(sorted(result.shared_indications))}"
+                        "  Shared Indication(s): %s"
+                        % ", ".join(sorted(result.shared_indications))
                     )
             for detail_line in result.outcome_detail.split("\n"):
-                lines.append(f"  {detail_line}")
+                lines.append("  %s" % detail_line)
 
         lines += [
             "", "-" * 90, "  SUMMARY", "-" * 90,
-            f"  Total drug pairs analysed    : {len(report.pair_results)}",
-            f"  Unique (no overlap)          : {len(report.unique_pairs)}",
-            f"  Duplicates/Overlaps detected : {len(report.duplicate_pairs)}",
-            f"    Overlap w/ rationale       : {len(report.supported_combinations)}",
-            f"    Redundant / contra         : {len(report.unsupported_duplicates)}",
+            "  Total drug pairs analysed    : %d" % len(report.pair_results),
+            "  Unique (no overlap)          : %d" % len(report.unique_pairs),
+            "  Duplicates/Overlaps detected : %d" % len(report.duplicate_pairs),
+            "    Overlap w/ rationale       : %d" % len(report.supported_combinations),
+            "    Redundant / contra         : %d" % len(report.unsupported_duplicates),
             "", "-" * 90, "  DATA SOURCES", "-" * 90,
-            "  Drug profiles : OpenFDA Drug Labels API (https://api.fda.gov/drug/label.json)",
+            "  Drug profiles : OpenFDA Drug Labels API + RxNorm/RxClass + Gemini classification",
             "  NICE rules    : Curated static library + NICE Evidence Search API",
+            "  RAG evaluator : Google Gemini (gemini_evaluator.evaluate_combination)",
             "  Persistence   : PostgreSQL (drug_profiles, combination_rules, analysis_results)",
             "  Fallback      : Local static knowledge base (drug_knowledge_base.py)",
             "",
@@ -414,14 +416,17 @@ class TherapeuticDuplicationChecker:
 # Legacy shims
 _default_checker: Optional[TherapeuticDuplicationChecker] = None
 
+
 def _get_default_checker() -> TherapeuticDuplicationChecker:
     global _default_checker
     if _default_checker is None:
         _default_checker = TherapeuticDuplicationChecker()
     return _default_checker
 
+
 def analyse_prescription(medications: List[str]) -> PrescriptionAnalysisReport:
     return _get_default_checker().analyse(medications)
+
 
 def format_report(report: PrescriptionAnalysisReport) -> str:
     return _get_default_checker().format_report(report)

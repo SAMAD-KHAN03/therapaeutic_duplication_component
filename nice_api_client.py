@@ -1,27 +1,31 @@
 """
 nice_api_client.py
 ------------------
-Fetches NICE guideline combination rules.
+Fetches NICE guideline combination rules and evaluates them via Gemini.
 
-Resolution order:
-  1. PostgreSQL cache (combination_rules table)
-  2. Static curated rules (nice_guidelines_db.py)  <- primary source
-  3. Live NICE Evidence Search API                 <- fallback when static returns nothing
+Resolution order inside find_combination_rules()
+-------------------------------------------------
+  1. PostgreSQL cache           (combination_rules table)
+  2. Static curated rules       (nice_guidelines_db.py)
+  3. Live NICE Evidence Search  (last resort when static returns nothing)
+
+After retrieval (steps 2 or 3), ALL retrieved guideline text is assembled
+into a RAG context block and sent to gemini_evaluator.evaluate_combination()
+which replaces all regex/substring classification of guideline text.
 
 Key features:
   - Bidirectional class-level matching (drug_a/drug_b are class strings)
-  - Same-class detection (e.g. NSAID vs NSAID, SSRI vs SSRI)
+  - Same-class detection (NSAID+NSAID, SSRI+SSRI, etc.)
   - Indication matching with "any" wildcard
   - Antimycobacterial multi-drug TB support
   - CONVENTIONAL_DMARD same-class + different MOA detection
-  - All caching via PostgreSQL (no disk/memory cache)
+  - All rule caching via PostgreSQL (no disk/memory cache)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -59,9 +63,14 @@ class NICEAPIError(Exception):
 
 def _nice_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict]:
     if params:
-        url = f"{url}?{urlencode(params)}"
-    req = Request(url, headers={"User-Agent": "TherapeuticDuplicationChecker/2.0",
-                                "Accept": "application/json"})
+        url = "%s?%s" % (url, urlencode(params))
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "TherapeuticDuplicationChecker/2.0",
+            "Accept": "application/json",
+        },
+    )
     try:
         time.sleep(_RATE_LIMIT_DELAY_SECONDS)
         with urlopen(req, timeout=_REQUEST_TIMEOUT_SECONDS) as resp:
@@ -69,7 +78,7 @@ def _nice_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dic
     except HTTPError as exc:
         if exc.code in (404, 410):
             return None
-        raise NICEAPIError(f"NICE API HTTP {exc.code}: {url}") from exc
+        raise NICEAPIError("NICE API HTTP %d: %s" % (exc.code, url)) from exc
     except URLError as exc:
         logger.warning("NICE API unreachable (%s).", exc.reason)
         return None
@@ -99,9 +108,9 @@ def _load_static_rules() -> List[Tuple[str, CombinationRule]]:
         return []
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Serialisation helpers for PostgreSQL storage
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def _rule_to_dict(rule: CombinationRule) -> Dict:
     return {**rule.__dict__, "conditions": list(rule.conditions)}
@@ -121,12 +130,72 @@ def _results_from_json(data: List[Dict]) -> List[Tuple[str, CombinationRule]]:
     return [(item["code"], _rule_from_dict(item["rule"])) for item in data]
 
 
+# ---------------------------------------------------------------------------
+# Build Gemini RAG context from retrieved rules
+# ---------------------------------------------------------------------------
+
+def _rules_to_gemini_contexts(
+    rules: List[Tuple[str, CombinationRule]],
+) -> List[Dict[str, str]]:
+    """
+    Convert a list of (code, CombinationRule) into the context block format
+    expected by gemini_evaluator.evaluate_combination().
+    """
+    contexts = []
+    for code, rule in rules:
+        text = "\n".join(filter(None, [
+            "Recommendation : %s" % rule.recommendation_text,
+            "Rationale      : %s" % rule.rationale,
+            "Conditions     : %s" % ("; ".join(rule.conditions) if rule.conditions else ""),
+            "Strength       : %s" % rule.strength,
+        ]))
+        contexts.append({
+            "source":  code,
+            "title":   "NICE %s" % code,
+            "section": rule.section_ref,
+            "text":    text,
+            "url":     rule.url,
+        })
+    return contexts
+
+
+def _search_item_to_context(
+    item: Dict,
+    drug_a: str,
+    drug_b: str,
+) -> Optional[Dict[str, str]]:
+    """
+    Convert a raw NICE Evidence Search result item into a Gemini context block.
+    Relevance filter: at least one of the drug names must appear in the text.
+    """
+    title   = item.get("title", "")
+    summary = item.get("summary", item.get("excerpt", ""))
+    url     = item.get("url", "")
+    code    = item.get("niceGuidanceRef", "NICE_SEARCH")
+    combined = ("%s %s" % (title, summary)).lower()
+
+    a_hit = drug_a.lower().replace("_", " ") in combined
+    b_hit = drug_b.lower().replace("_", " ") in combined
+    if not (a_hit or b_hit):
+        return None
+
+    return {
+        "source":  code,
+        "title":   title,
+        "section": code,
+        "text":    summary[:600] if summary else title,
+        "url":     url,
+    }
+
+
 class NICEAPIClient:
     """
-    Fetches NICE guideline combination rules.
+    Fetches NICE guideline combination rules and evaluates them via Gemini.
 
-    Matching is class-level and bidirectional.
-    All results are persisted to and read from PostgreSQL (combination_rules table).
+    After retrieving rules (static DB or live NICE API), all guideline text
+    is passed as RAG context to gemini_evaluator.evaluate_combination(), which
+    returns a structured verdict (SUPPORTED / CONDITIONAL / NOT_RECOMMENDED /
+    CONTRAINDICATED).  No regex or substring classification is used.
     """
 
     def __init__(
@@ -152,8 +221,12 @@ class NICEAPIClient:
         drug_b_name: str,
         shared_indications: Set[str],
     ) -> List[Tuple[str, CombinationRule]]:
+        """
+        Bidirectional class+name matching against the curated static rule set.
+        The recommendation field in each matched CombinationRule is used only
+        as a hint; the final verdict always comes from Gemini.
+        """
         matched: List[Tuple[str, CombinationRule]] = []
-
         ids_a = {drug_a_class, drug_a_name}
         ids_b = {drug_b_class, drug_b_name}
         same_class = drug_a_class == drug_b_class
@@ -189,77 +262,43 @@ class NICEAPIClient:
 
         return matched
 
-    def _query_nice_api(
+    def _fetch_nice_api_contexts(
         self,
         drug_a_class: str,
         drug_b_class: str,
         drug_a_name: str,
         drug_b_name: str,
         shared_indications: Set[str],
-    ) -> List[Tuple[str, CombinationRule]]:
-        """Live NICE Evidence Search API query (last resort)."""
-        results: List[Tuple[str, CombinationRule]] = []
-        ind_term = list(shared_indications)[0].replace("_", " ") if shared_indications else ""
+    ) -> List[Dict[str, str]]:
+        """
+        Query the live NICE Evidence Search API and return raw context blocks
+        (no classification -- Gemini will do that).
+        """
+        contexts: List[Dict[str, str]] = []
+        ind_term = (
+            list(shared_indications)[0].replace("_", " ")
+            if shared_indications else ""
+        )
 
         for a in [drug_a_name, drug_a_class.lower().replace("_", " ")]:
             for b in [drug_b_name, drug_b_class.lower().replace("_", " ")]:
-                query = f"{a} {b} combination {ind_term}".strip()
+                query = ("%s %s combination %s" % (a, b, ind_term)).strip()
                 try:
-                    data = _nice_get(NICE_EVIDENCE_SEARCH_BASE,
-                                     {"q": query, "type": "guideline", "size": 5})
+                    data = _nice_get(
+                        NICE_EVIDENCE_SEARCH_BASE,
+                        {"q": query, "type": "guideline", "size": 5},
+                    )
                     if not data:
                         continue
                     items = data.get("documents", data.get("results", []))
                     for item in items[:3]:
-                        rule = self._parse_search_item(item, drug_a_class, drug_b_class,
-                                                       shared_indications)
-                        if rule:
-                            code = item.get("niceGuidanceRef", "NICE_SEARCH")
-                            results.append((code, rule))
+                        ctx = _search_item_to_context(item, drug_a_class, drug_b_class)
+                        if ctx and ctx not in contexts:
+                            contexts.append(ctx)
                 except NICEAPIError as exc:
                     logger.error("NICE API error: %s", exc)
 
-        return results
-
-    def _parse_search_item(
-        self,
-        item: Dict,
-        drug_a: str,
-        drug_b: str,
-        shared_indications: Set[str],
-    ) -> Optional[CombinationRule]:
-        title   = item.get("title", "")
-        summary = item.get("summary", item.get("excerpt", ""))
-        url     = item.get("url", "")
-        code    = item.get("niceGuidanceRef", "NICE")
-        text    = f"{title} {summary}".lower()
-
-        a_found = drug_a.lower().replace("_", " ") in text
-        b_found = drug_b.lower().replace("_", " ") in text
-        if not (a_found or b_found):
-            return None
-
-        if re.search(r"\bcontraindicated\b|\bdo not (prescribe|use|combine)\b", text):
-            rec = "CONTRAINDICATED"
-        elif re.search(r"\bnot recommended\b|\bavoid\b|\bshould not\b", text):
-            rec = "NOT_RECOMMENDED"
-        elif re.search(r"\b(consider|may be used|can be used)\b", text):
-            rec = "CONDITIONAL"
-        elif re.search(r"\b(offer|recommend|use|add)\b", text):
-            rec = "SUPPORTED"
-        else:
-            rec = "CONDITIONAL"
-
-        ind = list(shared_indications)[0] if shared_indications else "any"
-        return CombinationRule(
-            drug_a=drug_a, drug_b=drug_b, indication=ind,
-            recommendation=rec,
-            recommendation_text=summary[:400] if summary else title,
-            strength="Strong" if rec in ("CONTRAINDICATED", "NOT_RECOMMENDED", "SUPPORTED") else "Conditional",
-            section_ref=code, url=url,
-            rationale=f"Extracted from NICE guidance: {title}",
-            conditions=[],
-        )
+        return contexts
 
     def find_combination_rules(
         self,
@@ -268,10 +307,22 @@ class NICEAPIClient:
         drug_a_name: str,
         drug_b_name: str,
         shared_indications: Set[str],
+        # full DrugProfile objects -- used to give Gemini class + MOA context
+        profile_a=None,
+        profile_b=None,
     ) -> List[Tuple[str, CombinationRule]]:
+        """
+        Retrieve NICE rules then ask Gemini to evaluate the combination.
+
+        Returns a list containing a single (code, CombinationRule) tuple whose
+        recommendation, rationale, conditions, and strength are populated from
+        the Gemini verdict rather than from regex matching.
+        """
+        from gemini_evaluator import evaluate_combination
+
         ind_list = sorted(shared_indications)
 
-        # 1 — PostgreSQL cache
+        # 1 -- PostgreSQL cache
         try:
             cached = pg_store.load_combination_rules(
                 drug_a_class, drug_b_class, drug_a_name, drug_b_name, ind_list
@@ -282,35 +333,91 @@ class NICEAPIClient:
         except Exception as exc:
             logger.warning("PG rule load failed: %s", exc)
 
-        results: List[Tuple[str, CombinationRule]] = []
+        # 2 -- Static rules -> build RAG contexts
+        rag_contexts: List[Dict[str, str]] = []
+        static_rules: List[Tuple[str, CombinationRule]] = []
 
-        # 2 — Static rules
         if self._use_static:
-            results = self._match_static_rules(
+            static_rules = self._match_static_rules(
                 drug_a_class, drug_b_class,
                 drug_a_name,  drug_b_name,
                 shared_indications,
             )
-            if results:
+            if static_rules:
                 logger.info(
                     "Static NICE rules matched for %s + %s: %d rule(s)",
-                    drug_a_name, drug_b_name, len(results),
+                    drug_a_name, drug_b_name, len(static_rules),
                 )
+                rag_contexts = _rules_to_gemini_contexts(static_rules)
 
-        # 3 — Live NICE API
-        if not results:
+        # 3 -- Live NICE API -> more RAG contexts (used when static returns nothing)
+        if not static_rules:
             try:
-                api_results = self._query_nice_api(
+                api_contexts = self._fetch_nice_api_contexts(
                     drug_a_class, drug_b_class,
                     drug_a_name,  drug_b_name,
                     shared_indications,
                 )
-                results.extend(api_results)
-                if api_results:
-                    logger.info("NICE API returned %d rule(s) for %s + %s",
-                                len(api_results), drug_a_name, drug_b_name)
+                rag_contexts.extend(api_contexts)
+                if api_contexts:
+                    logger.info(
+                        "NICE API returned %d context block(s) for %s + %s",
+                        len(api_contexts), drug_a_name, drug_b_name,
+                    )
             except Exception as exc:
                 logger.error("NICE live lookup failed: %s", exc)
+
+        # 4 -- Gemini RAG evaluation
+        #
+        # Regardless of whether we got rules from the static DB, the live API,
+        # or neither, we always send everything to Gemini.  Gemini uses the RAG
+        # context if available, otherwise falls back to pharmacological reasoning.
+        a_class = drug_a_class
+        a_moa   = profile_a.mechanism_of_action if profile_a else "UNKNOWN"
+        b_class = drug_b_class
+        b_moa   = profile_b.mechanism_of_action if profile_b else "UNKNOWN"
+
+        verdict = evaluate_combination(
+            drug_a_name=drug_a_name,
+            drug_a_class=a_class,
+            drug_a_moa=a_moa,
+            drug_b_name=drug_b_name,
+            drug_b_class=b_class,
+            drug_b_moa=b_moa,
+            shared_indications=shared_indications,
+            guideline_contexts=rag_contexts,
+        )
+
+        # Build a single CombinationRule from the Gemini verdict.
+        # Use the first static/API rule's metadata (URL, section_ref) if available,
+        # otherwise use sensible defaults.
+        if static_rules:
+            ref_code, ref_rule = static_rules[0]
+            section_ref = ref_rule.section_ref
+            url         = ref_rule.url
+        elif rag_contexts:
+            ref_code    = rag_contexts[0].get("source", "NICE")
+            section_ref = rag_contexts[0].get("section", "")
+            url         = rag_contexts[0].get("url", "")
+        else:
+            ref_code    = "NICE"
+            section_ref = "No specific guideline found"
+            url         = "https://www.nice.org.uk"
+
+        gemini_rule = CombinationRule(
+            drug_a=drug_a_name,
+            drug_b=drug_b_name,
+            indication=ind_list[0] if ind_list else "any",
+            recommendation=verdict["recommendation"],
+            recommendation_text=verdict["rationale"],
+            strength=verdict.get("strength", "Moderate"),
+            section_ref=section_ref,
+            url=url,
+            rationale=verdict["rationale"],
+            conditions=verdict.get("conditions", []),
+        )
+
+        results = [(ref_code, gemini_rule)]
 
         # Persist to PostgreSQL
         try:
@@ -324,7 +431,7 @@ class NICEAPIClient:
         return results
 
     def get_guideline_summary(self, guideline_code: str) -> Optional[Dict]:
-        url = f"https://www.nice.org.uk/guidance/{guideline_code.lower()}.json"
+        url = "https://www.nice.org.uk/guidance/%s.json" % guideline_code.lower()
         return _nice_get(url)
 
     def list_available_guidelines(self) -> List[str]:
@@ -334,5 +441,7 @@ class NICEAPIClient:
         if self._static_rules is None:
             self._static_rules = _load_static_rules()
         self._static_rules.append((guideline_code, rule))
-        logger.info("Custom rule added: %s <-> %s [%s]",
-                    rule.drug_a, rule.drug_b, rule.recommendation)
+        logger.info(
+            "Custom rule added: %s <-> %s [%s]",
+            rule.drug_a, rule.drug_b, rule.recommendation,
+        )

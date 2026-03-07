@@ -3,32 +3,33 @@ gemini_evaluator.py
 -------------------
 All Gemini API calls for the Therapeutic Duplication Checker.
 
+Uses the google-genai package (google.genai) -- NOT the old google-generativeai.
+Install: ./venv/bin/pip install google-genai
+
 Two public functions
 ---------------------
 evaluate_combination(...)
-    Takes a drug pair + all retrieved NICE guideline context (the RAG) and
+    Takes a drug pair + all retrieved NICE guideline context (RAG) and
     returns a structured clinical verdict:
         SUPPORTED | CONDITIONAL | NOT_RECOMMENDED | CONTRAINDICATED
 
 classify_drug(...)
-    Takes a drug name + whatever raw text FDA + RxNorm returned and asks
-    Gemini to infer pharmacological class and MOA when local lookup tables
-    produced UNKNOWN.
+    Takes a drug name + raw FDA/RxNorm text and asks Gemini to infer
+    pharmacological class and MOA when local lookup tables gave UNKNOWN.
 
 Environment variable
 ---------------------
     GEMINI_API_KEY   -- Google AI Studio key
                         https://aistudio.google.com/app/apikey
 
-Optional overrides (also in .env)
------------------------------------
-    GEMINI_MODEL     -- default: gemini-1.5-flash
+Optional overrides (.env)
+--------------------------
+    GEMINI_MODEL     -- default: gemini-2.0-flash
     GEMINI_TIMEOUT   -- default: 30
 
-Fallback behaviour
-------------------
-If the SDK is missing, the API key is absent, or Gemini returns an
-unparseable response, every public function returns a safe default so the
+Fallback
+--------
+Missing key / SDK error / unparseable JSON -> safe default returned,
 pipeline continues without crashing.
 """
 
@@ -47,23 +48,23 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SDK
+# google-genai SDK  (pip install google-genai)
 # ---------------------------------------------------------------------------
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     _SDK_AVAILABLE = True
 except ImportError:
     _SDK_AVAILABLE = False
     logger.warning(
-        "google-generativeai not installed. "
-        "Run: ./venv/bin/pip install google-generativeai  "
+        "google-genai not installed. "
+        "Run: ./venv/bin/pip install google-genai  "
         "Gemini calls will be skipped and safe fallback values returned."
     )
 
-_MODEL_NAME     = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-_TIMEOUT        = int(os.getenv("GEMINI_TIMEOUT", "30"))
+_MODEL_NAME     = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 _RETRY_ATTEMPTS = 2
-_RETRY_DELAY    = 2.0
+_RETRY_DELAY    = 2.0  # seconds between retries
 
 _VALID_RECOMMENDATIONS = {"SUPPORTED", "CONDITIONAL", "NOT_RECOMMENDED", "CONTRAINDICATED"}
 
@@ -86,36 +87,45 @@ def _get_client() -> Optional[Any]:
             "Add GEMINI_API_KEY=<key> to your .env file."
         )
         return None
-    genai.configure(api_key=api_key)
-    _client = genai.GenerativeModel(_MODEL_NAME)
+    _client = genai.Client(api_key=api_key)
     logger.info("Gemini client initialised (model: %s)", _MODEL_NAME)
     return _client
 
 
 def _call_gemini(prompt: str) -> Optional[str]:
-    """Send prompt, return raw text or None on failure."""
+    """Send prompt to Gemini, return raw response text or None on failure."""
     client = _get_client()
     if client is None:
         return None
+
+    config = genai_types.GenerateContentConfig(
+        temperature=0.1,        # low temp for deterministic clinical output
+        max_output_tokens=1024,
+    ) if _SDK_AVAILABLE else None
+
     for attempt in range(1, _RETRY_ATTEMPTS + 1):
         try:
-            response = client.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=1024,
-                ),
+            response = client.models.generate_content(
+                model=_MODEL_NAME,
+                contents=prompt,
+                config=config,
             )
             return response.text.strip()
         except Exception as exc:
-            logger.warning("Gemini attempt %d/%d failed: %s", attempt, _RETRY_ATTEMPTS, exc)
+            logger.warning(
+                "Gemini attempt %d/%d failed: %s: %s",
+                attempt, _RETRY_ATTEMPTS, type(exc).__name__, exc,
+            )
             if attempt < _RETRY_ATTEMPTS:
                 time.sleep(_RETRY_DELAY)
     return None
 
 
 def _parse_json(text: str) -> Optional[Dict]:
-    """Extract JSON from a Gemini response, stripping markdown fences if present."""
+    """
+    Extract a JSON object from a Gemini response.
+    Strips markdown code fences (```json ... ```) if present.
+    """
     if not text:
         return None
     cleaned = text.strip()
@@ -125,6 +135,7 @@ def _parse_json(text: str) -> Optional[Dict]:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
+        # Try to fish out first { ... } block
         start = text.find("{")
         end   = text.rfind("}") + 1
         if start != -1 and end > start:
@@ -175,15 +186,11 @@ def evaluate_combination(
     guideline_contexts: List[Dict[str, str]],
 ) -> Dict[str, Any]:
     """
-    Send the drug pair + all retrieved NICE guideline text to Gemini and
-    return a structured verdict dict.
+    Send drug pair + all NICE guideline text (RAG) to Gemini.
+    Returns structured verdict dict.
 
     guideline_contexts: list of dicts with keys:
-        source   -- guideline code or "NICE_SEARCH"
-        title    -- document title
-        section  -- section ref
-        text     -- guideline text excerpt
-        url      -- source URL
+        source, title, section, text, url
 
     Returns dict with keys:
         recommendation, strength, rationale, conditions,
@@ -218,11 +225,12 @@ def evaluate_combination(
 
     prompt = "\n\n".join([
         _EVAL_SYSTEM,
-        "=== DRUG COMBINATION ===\n\n"
-        "Drug A : %s\n  Class : %s\n  MOA   : %s\n\n"
-        "Drug B : %s\n  Class : %s\n  MOA   : %s\n\n"
-        "Shared indications : %s"
-        % (
+        (
+            "=== DRUG COMBINATION ===\n\n"
+            "Drug A : %s\n  Class : %s\n  MOA   : %s\n\n"
+            "Drug B : %s\n  Class : %s\n  MOA   : %s\n\n"
+            "Shared indications : %s"
+        ) % (
             drug_a_name, drug_a_class, drug_a_moa,
             drug_b_name, drug_b_class, drug_b_moa,
             indications_str,
@@ -286,7 +294,7 @@ _CLASSIFY_SYSTEM = (
     '  "confidence": "<HIGH | MEDIUM | LOW>",\n'
     '  "reasoning": "<1-2 sentences explaining your classification>"\n'
     "}\n\n"
-    "Canonical drug_class values (use exactly where applicable, else UPPER_SNAKE_CASE):\n"
+    "Canonical drug_class values (use exactly, else UPPER_SNAKE_CASE):\n"
     "  ACE_INHIBITOR, ARB, ARNI, BETA_BLOCKER, CALCIUM_CHANNEL_BLOCKER,\n"
     "  STATIN, EZETIMIBE, VITAMIN_K_ANTAGONIST, DOAC_FACTOR_Xa_INHIBITOR,\n"
     "  DOAC_THROMBIN_INHIBITOR, SGLT2_INHIBITOR, GLP1_AGONIST, DPP4_INHIBITOR,\n"
@@ -294,7 +302,7 @@ _CLASSIFY_SYSTEM = (
     "  COX2_INHIBITOR, PPI, THIAZIDE_DIURETIC,\n"
     "  MINERALOCORTICOID_RECEPTOR_ANTAGONIST, CONVENTIONAL_DMARD,\n"
     "  ANTIMYCOBACTERIAL, FOLATE_SUPPLEMENT, UNKNOWN\n\n"
-    "Canonical mechanism_of_action values (use exactly where applicable, else UPPER_SNAKE_CASE):\n"
+    "Canonical mechanism_of_action values (use exactly, else UPPER_SNAKE_CASE):\n"
     "  RAAS_INHIBITION_ACEi, RAAS_INHIBITION_ARB, RAAS_INHIBITION_ARNI,\n"
     "  BETA_ADRENERGIC_BLOCKADE, CALCIUM_CHANNEL_BLOCKADE,\n"
     "  HMG_COA_REDUCTASE_INHIBITION, INTESTINAL_CHOLESTEROL_ABSORPTION_INHIBITION,\n"
@@ -321,26 +329,19 @@ def classify_drug(
     """
     Ask Gemini to classify a drug when local lookups gave UNKNOWN.
 
-    Parameters
-    ----------
-    drug_name            : generic drug name
-    raw_pharm_class      : pharm_class_epc + pharm_class_moa from FDA label
-    rxnorm_classes       : class names from RxNorm RxClass API
-    fda_moa_text         : mechanism_of_action / clinical_pharmacology from FDA
-    fda_description_text : description text from FDA label
-
     Returns dict with keys:
         drug_class, mechanism_of_action, confidence, reasoning, gemini_used (bool)
     """
     prompt = "\n\n".join([
         _CLASSIFY_SYSTEM,
-        "=== DRUG TO CLASSIFY ===\n\n"
-        "Drug name         : %s\n"
-        "FDA pharm class   : %s\n"
-        "RxNorm drug class : %s\n"
-        "FDA MOA text      : %s\n"
-        "FDA description   : %s"
-        % (
+        (
+            "=== DRUG TO CLASSIFY ===\n\n"
+            "Drug name         : %s\n"
+            "FDA pharm class   : %s\n"
+            "RxNorm drug class : %s\n"
+            "FDA MOA text      : %s\n"
+            "FDA description   : %s"
+        ) % (
             drug_name,
             "; ".join(raw_pharm_class) or "not available",
             "; ".join(rxnorm_classes)  or "not available",

@@ -187,10 +187,17 @@ _EPC_MOA_TO_MOA: List[Tuple[str, str]] = [
 ]
 
 _FREETEXT_CLASS_PATTERNS: List[Tuple[str, str]] = [
-    (r"angiotensin.converting enzyme\s+inhibit|ace\s+inhibit",              "ACE_INHIBITOR"),
+    # SSRI/SNRI MUST come before BETA_BLOCKER -- SSRI labels mention
+    # "beta-adrenergic" in the context of what they do NOT do, which
+    # would cause a false BETA_BLOCKER match if order were reversed.
+    (r"selective serotonin reuptake inhibit|\bssri\b",                     "SSRI"),
+    (r"serotonin.*norepinephrine reuptake inhibit|\bsnri\b",               "SNRI"),
+    (r"serotonin reuptake inhibit",                                         "SSRI"),
+    (r"angiotensin.converting enzyme\s+inhibit|\bace\s+inhibit",           "ACE_INHIBITOR"),
     (r"angiotensin.ii.*receptor.*antagonist|angiotensin.*receptor.*blocker", "ARB"),
     (r"neprilysin.*inhibit",                                                 "ARNI"),
-    (r"beta.?adrenergic.{0,15}block|beta.?blocker",                         "BETA_BLOCKER"),
+    # Note: BETA_BLOCKER uses _match_regex_negation_aware() not this list directly
+    (r"__BETA_BLOCKER_SENTINEL__",                                          "BETA_BLOCKER"),
     (r"calcium channel.{0,15}(block|antagonist)",                           "CALCIUM_CHANNEL_BLOCKER"),
     (r"hmg.?coa reductase inhibit|hydroxymethylglutaryl",                   "STATIN"),
     (r"\bstatin\b",                                                          "STATIN"),
@@ -202,24 +209,26 @@ _FREETEXT_CLASS_PATTERNS: List[Tuple[str, str]] = [
     (r"glp.?1 receptor agonist|glucagon.like peptide.{0,5}receptor",       "GLP1_AGONIST"),
     (r"dpp.?4|dipeptidyl peptidase",                                        "DPP4_INHIBITOR"),
     (r"\bbiguanide\b|hepatic glucose.{0,20}(produc|output)",                "BIGUANIDE"),
-    (r"selective serotonin reuptake inhibit|ssri",                          "SSRI"),
-    (r"serotonin.*norepinephrine reuptake inhibit|snri",                    "SNRI"),
-    (r"nonsteroidal anti.inflammatory|nsaid|cyclooxygenase.{0,15}inhibit",  "NSAID"),
-    (r"cyclooxygenase.?2.{0,15}(select|specific)|cox.?2",                  "COX2_INHIBITOR"),
+    (r"nonsteroidal anti.inflammatory|\bnsaid\b|cyclooxygenase.{0,15}inhibit",  "NSAID"),
+    (r"cyclooxygenase.?2.{0,15}(select|specific)|\bcox.?2\b",               "COX2_INHIBITOR"),
     (r"proton pump inhibit|h\+/k\+.atpase",                                "PPI"),
     (r"thiazide|sulfonamide.{0,15}diuretic|indapamide",                    "THIAZIDE_DIURETIC"),
     (r"mineralocorticoid.{0,15}receptor.{0,15}antag|aldosterone.{0,15}antag|spironolactone", "MINERALOCORTICOID_RECEPTOR_ANTAGONIST"),
     (r"\bsulfonylurea\b|atp.sensitive.{0,15}potassium.{0,15}channel|atp.k.channel", "SULFONYLUREA"),
     (r"long.acting insulin|basal insulin|insulin.{0,20}glargine|insulin.{0,20}detemir|insulin.{0,20}degludec", "INSULIN_LONG_ACTING"),
-    (r"disease.modifying antirheumatic|dmard|dihydrofolate reductase|methotrexate|sulfasalazine|hydroxychloroquine", "CONVENTIONAL_DMARD"),
+    (r"disease.modifying antirheumatic|\bdmard\b|dihydrofolate reductase|methotrexate|sulfasalazine|hydroxychloroquine", "CONVENTIONAL_DMARD"),
     (r"mycolic acid|antimycobacterial|antituberculosis|anti-tuberculosis|isoniazid|rifampin|rifampicin|pyrazinamide|ethambutol", "ANTIMYCOBACTERIAL"),
 ]
 
 _FREETEXT_MOA_PATTERNS: List[Tuple[str, str]] = [
-    (r"angiotensin.converting enzyme\s+inhibit|ace\s+inhibit",              "RAAS_INHIBITION_ACEi"),
+    # SEROTONIN patterns MUST come before BETA_ADRENERGIC -- same reason as class patterns.
+    (r"serotonin reuptake inhibit",                                         "SEROTONIN_REUPTAKE_INHIBITION"),
+    (r"serotonin.*norepinephrine reuptake inhibit",                         "SEROTONIN_NOREPINEPHRINE_REUPTAKE_INHIBITION"),
+    (r"angiotensin.converting enzyme\s+inhibit|\bace\s+inhibit",           "RAAS_INHIBITION_ACEi"),
     (r"angiotensin.ii.*receptor.*antagonist|angiotensin.*receptor.*blocker", "RAAS_INHIBITION_ARB"),
     (r"neprilysin.*inhibit",                                                 "RAAS_INHIBITION_ARNI"),
-    (r"beta.?adrenergic.{0,15}block",                                       "BETA_ADRENERGIC_BLOCKADE"),
+    # BETA_ADRENERGIC uses _match_regex_negation_aware(), not this list directly
+    (r"__BETA_ADRENERGIC_SENTINEL__",                                       "BETA_ADRENERGIC_BLOCKADE"),
     (r"calcium channel.{0,15}(block|antagonist)",                           "CALCIUM_CHANNEL_BLOCKADE"),
     (r"hmg.?coa reductase inhibit|hydroxymethylglutaryl",                   "HMG_COA_REDUCTASE_INHIBITION"),
     (r"cholesterol absorption inhibit|npc1l1",                              "INTESTINAL_CHOLESTEROL_ABSORPTION_INHIBITION"),
@@ -230,14 +239,12 @@ _FREETEXT_MOA_PATTERNS: List[Tuple[str, str]] = [
     (r"glp.?1 receptor agonist|glucagon.like peptide.{0,5}receptor",       "GLP1_RECEPTOR_AGONISM"),
     (r"dpp.?4|dipeptidyl peptidase",                                        "DPP4_INHIBITION_GLP1_AUGMENTATION"),
     (r"\bbiguanide\b|ampk|hepatic glucose.{0,20}(produc|output)",           "AMPK_ACTIVATION_HEPATIC_GLUCOSE_REDUCTION"),
-    (r"serotonin reuptake inhibit",                                         "SEROTONIN_REUPTAKE_INHIBITION"),
-    (r"serotonin.*norepinephrine reuptake inhibit",                         "SEROTONIN_NOREPINEPHRINE_REUPTAKE_INHIBITION"),
     (r"cyclooxygenase.?2.{0,15}(select|specific)|cox.?2.*inhibit",         "COX2_INHIBITION_SELECTIVE"),
     (r"cyclooxygen|nonsteroidal anti.inflammatory",                         "COX_INHIBITION_NONSELECTIVE"),
     (r"proton pump inhibit|h\+/k\+.atpase",                                "H_K_ATPase_INHIBITION"),
     (r"thiazide|sodium.{0,15}chloride.{0,15}reabsorption",                 "RENAL_SODIUM_CHLORIDE_REABSORPTION_INHIBITION"),
     (r"mineralocorticoid.{0,15}receptor|aldosterone.{0,15}antag",          "ALDOSTERONE_RECEPTOR_BLOCKADE"),
-    (r"atp.sensitive.{0,15}potassium|sulfonylurea|insulin secretion",       "PANCREATIC_INSULIN_SECRETION_ATP_K_CHANNEL"),
+    (r"atp.sensitive.{0,15}potassium|\bsulfonylurea\b|insulin secretion",  "PANCREATIC_INSULIN_SECRETION_ATP_K_CHANNEL"),
     (r"long.acting insulin|basal insulin|insulin.receptor",                 "INSULIN_RECEPTOR_ACTIVATION"),
     (r"dihydrofolate reductase",                                            "DIHYDROFOLATE_REDUCTASE_INHIBITION"),
     (r"immunomodul|nf.?kb|cytokine.{0,15}suppres",                         "IMMUNOMODULATION_NFKB_CYTOKINE_SUPPRESSION"),
@@ -291,10 +298,44 @@ def _match_substring(text: str, patterns: List[Tuple[str, str]]) -> Optional[str
     return None
 
 
+_BETA_CLASS_PATTERN = r"\bbeta.?adrenergic.{0,15}block|\bbeta.?blocker"
+_BETA_MOA_PATTERN   = r"\bbeta.?adrenergic.{0,15}block"
+_NEGATION_PREFIX    = re.compile(
+    r"\b(no|not|without|lacks?|absence of|devoid of|inhibit\s+\w+)\s*$"
+)
+
+
+def _is_negated_beta(text: str) -> bool:
+    """
+    Return True if every occurrence of a beta-blocker pattern in text is
+    immediately preceded by a negation word (no, not, without, lacks, etc.).
+    Used to prevent SSRI labels -- which say "does not inhibit beta-adrenergic
+    receptors" -- from being misclassified as BETA_BLOCKER.
+    """
+    text = text.lower()
+    any_positive = False
+    for m in re.finditer(_BETA_CLASS_PATTERN, text):
+        prefix = text[max(0, m.start() - 40): m.start()]
+        if not _NEGATION_PREFIX.search(prefix):
+            any_positive = True
+    return not any_positive
+
+
 def _match_regex(text: str, patterns: List[Tuple[str, str]]) -> Optional[str]:
+    """
+    Match text against ordered (pattern, canonical) pairs.
+    Sentinels __BETA_BLOCKER_SENTINEL__ and __BETA_ADRENERGIC_SENTINEL__
+    invoke negation-aware beta matching instead of a plain regex search.
+    """
     t = text.lower()
     for pattern, canonical in patterns:
-        if re.search(pattern, t):
+        if pattern == "__BETA_BLOCKER_SENTINEL__":
+            if not _is_negated_beta(t):
+                return canonical
+        elif pattern == "__BETA_ADRENERGIC_SENTINEL__":
+            if not _is_negated_beta(t):
+                return canonical
+        elif re.search(pattern, t):
             return canonical
     return None
 

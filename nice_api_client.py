@@ -159,14 +159,94 @@ def _rules_to_gemini_contexts(
     return contexts
 
 
+# ---------------------------------------------------------------------------
+# Built-in pharmacological knowledge for same-class combinations.
+# Gemini receives this when no NICE guideline context is found so it
+# always has accurate pharmacological grounding, not just class strings.
+# ---------------------------------------------------------------------------
+_SAME_CLASS_KNOWLEDGE: dict = {
+    "SSRI": (
+        "Combining two SSRIs (selective serotonin reuptake inhibitors) is generally "
+        "contraindicated. Co-prescribing two SSRIs dramatically increases the risk of "
+        "serotonin syndrome -- a potentially life-threatening condition characterised by "
+        "hyperthermia, agitation, clonus, and autonomic instability. NICE depression "
+        "guidelines (CG90, NG222) recommend optimising the dose of a single SSRI before "
+        "switching or augmenting, and do not endorse dual-SSRI therapy. Clinical guidelines "
+        "worldwide consistently advise against combining two serotonergic agents of the same "
+        "class due to additive serotonergic toxicity."
+    ),
+    "SNRI": (
+        "Combining two SNRIs (serotonin-norepinephrine reuptake inhibitors) carries the same "
+        "serotonin syndrome risk as dual-SSRI use and is not recommended. NICE guidelines "
+        "advise single-agent antidepressant optimisation before augmentation strategies."
+    ),
+    "NSAID": (
+        "Concurrent use of two NSAIDs significantly increases the risk of serious GI toxicity "
+        "(peptic ulceration, GI bleeding) and renal impairment without additional analgesic "
+        "benefit. NICE guidelines (NG59, CG177) specifically advise against prescribing more "
+        "than one NSAID at a time."
+    ),
+    "COX2_INHIBITOR": (
+        "Combining two COX-2 inhibitors provides no additional anti-inflammatory benefit and "
+        "doubles the risk of cardiovascular and GI adverse effects. Dual COX-2 therapy is not "
+        "recommended by any clinical guideline."
+    ),
+    "ACE_INHIBITOR": (
+        "Dual ACE inhibitor therapy is irrational -- two drugs with identical mechanisms "
+        "provide no additional benefit and increase risks of hypotension, hyperkalaemia, and "
+        "acute kidney injury. NICE hypertension guidelines (NG136) recommend single-agent ACEi."
+    ),
+    "ARB": (
+        "Combining two ARBs is contraindicated. It provides no additional benefit and "
+        "significantly increases hyperkalaemia and AKI risk, as established in the ONTARGET "
+        "trial. NICE NG136 does not support dual ARB therapy."
+    ),
+    "STATIN": (
+        "Combining two statins is not recommended. It does not produce additive LDL reduction "
+        "beyond the logarithmic dose-response curve and increases the risk of myopathy and "
+        "rhabdomyolysis. NICE lipid guidelines (NG238) recommend dose optimisation of a single "
+        "statin plus ezetimibe if needed."
+    ),
+    "BETA_BLOCKER": (
+        "Combining two beta-blockers is not clinically indicated. It produces excessive "
+        "beta-blockade, increasing the risk of bradycardia, heart block, and bronchospasm "
+        "without therapeutic advantage. NICE guidelines use single beta-blocker therapy."
+    ),
+    "PPI": (
+        "There is no clinical rationale for combining two proton pump inhibitors. A single "
+        "PPI at appropriate dose is sufficient for acid suppression. Dual PPI use is not "
+        "recommended in any NICE guideline."
+    ),
+}
+
+
+def _same_class_knowledge_context(drug_class: str) -> Optional[Dict[str, str]]:
+    """Return a built-in knowledge block if we have pharmacological guidance for this class."""
+    knowledge = _SAME_CLASS_KNOWLEDGE.get(drug_class)
+    if not knowledge:
+        return None
+    return {
+        "source":  "PHARMACOLOGICAL_KNOWLEDGE",
+        "title":   "Same-class combination: %s" % drug_class,
+        "section": "Pharmacological principles",
+        "text":    knowledge,
+        "url":     "https://www.nice.org.uk/guidance",
+    }
+
+
 def _search_item_to_context(
     item: Dict,
-    drug_a: str,
-    drug_b: str,
+    drug_a_name: str,
+    drug_b_name: str,
+    drug_a_class: str,
+    drug_b_class: str,
 ) -> Optional[Dict[str, str]]:
     """
     Convert a raw NICE Evidence Search result item into a Gemini context block.
-    Relevance filter: at least one of the drug names must appear in the text.
+
+    Relevance filter: at least one of the DRUG NAMES (not class strings) must
+    appear in the title or summary -- class strings like "SSRI" rarely appear
+    verbatim in NICE document titles.
     """
     title   = item.get("title", "")
     summary = item.get("summary", item.get("excerpt", ""))
@@ -174,9 +254,16 @@ def _search_item_to_context(
     code    = item.get("niceGuidanceRef", "NICE_SEARCH")
     combined = ("%s %s" % (title, summary)).lower()
 
-    a_hit = drug_a.lower().replace("_", " ") in combined
-    b_hit = drug_b.lower().replace("_", " ") in combined
-    if not (a_hit or b_hit):
+    # Check drug names (more reliable than class names in NICE search results)
+    hits = [
+        drug_a_name.lower() in combined,
+        drug_b_name.lower() in combined,
+        drug_a_class.lower().replace("_", " ") in combined,
+        drug_b_class.lower().replace("_", " ") in combined,
+        "antidepressant" in combined,  # catches SSRI/SNRI guidelines
+        "serotonin" in combined,
+    ]
+    if not any(hits):
         return None
 
     return {
@@ -292,7 +379,11 @@ class NICEAPIClient:
                         continue
                     items = data.get("documents", data.get("results", []))
                     for item in items[:3]:
-                        ctx = _search_item_to_context(item, drug_a_class, drug_b_class)
+                        ctx = _search_item_to_context(
+                            item,
+                            drug_a_name, drug_b_name,
+                            drug_a_class, drug_b_class,
+                        )
                         if ctx and ctx not in contexts:
                             contexts.append(ctx)
                 except NICEAPIError as exc:
@@ -366,6 +457,19 @@ class NICEAPIClient:
                     )
             except Exception as exc:
                 logger.error("NICE live lookup failed: %s", exc)
+
+        # 3b -- Inject built-in pharmacological knowledge for same-class pairs.
+        # This ensures Gemini always has accurate grounding even when no NICE
+        # guideline document directly covers the combination.
+        if drug_a_class == drug_b_class:
+            knowledge_ctx = _same_class_knowledge_context(drug_a_class)
+            if knowledge_ctx:
+                # Prepend so Gemini sees it before any live API results
+                rag_contexts.insert(0, knowledge_ctx)
+                logger.info(
+                    "Injected same-class knowledge context for %s pair (%s + %s)",
+                    drug_a_class, drug_a_name, drug_b_name,
+                )
 
         # 4 -- Gemini RAG evaluation
         #

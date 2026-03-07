@@ -94,6 +94,7 @@ def _get_client() -> Optional[Any]:
 
 def _call_gemini(prompt: str) -> Optional[str]:
     """Send prompt to Gemini, return raw response text or None on failure."""
+    print("calling gemini")
     client = _get_client()
     if client is None:
         return None
@@ -110,6 +111,7 @@ def _call_gemini(prompt: str) -> Optional[str]:
                 contents=prompt,
                 config=config,
             )
+            print(f"repsonse received is {response}")
             return response.text.strip()
         except Exception as exc:
             logger.warning(

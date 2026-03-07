@@ -1,2 +1,4 @@
 new_env
 .env
+*.pyc
+__pycache__
